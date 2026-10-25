@@ -13,7 +13,7 @@
 #include <pthread.h>
 
 typedef struct { uint32_t id; uint8_t *data; size_t size; } amiibo_area;
-typedef struct { char id[17]; uint8_t uuid[9]; int uuid_len; char first[40], last[40]; uint16_t writes; char nick[64]; amiibo_area *areas; int n_areas; char *extra; } amiibo_file;
+typedef struct { uint32_t version; char id[17]; uint8_t uuid[9]; int uuid_len; char first[40], last[40]; uint16_t writes; char nick[64]; amiibo_area *areas; int n_areas; char *extra; } amiibo_file;
 
 // ---- base64 ----
 static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -164,7 +164,12 @@ static int parse_areas(const char **p, amiibo_file *f) {
     }
 }
 
-static void copy_str(char *dst, size_t cap, const char *s) { snprintf(dst, cap, "%s", s); }
+static void copy_str(char *dst, size_t cap, const char *s) {   // a cut text ends on a UTF-8 character boundary
+    snprintf(dst, cap, "%s", s);
+    size_t n = cap - 1; if (strlen(s) <= n) return;
+    while (n > 0 && ((unsigned char)s[n] & 0xc0) == 0x80) n--;
+    dst[n] = 0;
+}
 
 // Parses the text of one amiibo file into f (f->id is set by the caller); returns 0 on success.
 static int amiibo_parse(const char *text, amiibo_file *f) {
@@ -195,7 +200,7 @@ static int amiibo_parse(const char *text, amiibo_file *f) {
             }
         } else if (!strcmp(k, "WriteCounter")) { rc = js_uint(&p, &v); if (!rc) f->writes = (uint16_t)v; }
         else if (!strcmp(k, "ApplicationAreas")) rc = parse_areas(&p, f);
-        else if (!strcmp(k, "FileVersion")) rc = js_uint(&p, &v);
+        else if (!strcmp(k, "FileVersion")) { rc = js_uint(&p, &v); if (!rc && v > 0xffffffffull) rc = -1; f->version = (uint32_t)v; }
         else {
             js_ws(&p); rc = js_skip(&p, 0);
             if (!rc) { if (extra.n) sb_str(&extra, ","); sb_put(&extra, kstart, (size_t)(p - kstart)); }
@@ -251,7 +256,7 @@ static void js_put_string(sbuf *b, const char *s) {
 
 static int amiibo_save(const amiibo_file *f) {
     sbuf b = {0}; char num[96];
-    sb_str(&b, "{\"FileVersion\":0,\"TagUuid\":\"");
+    snprintf(num, sizeof num, "{\"FileVersion\":%u,\"TagUuid\":\"", f->version); sb_str(&b, num);
     b64_encode(&b, f->uuid, (size_t)f->uuid_len);
     sb_str(&b, "\",\"AmiiboId\":"); js_put_string(&b, f->id);
     sb_str(&b, ",\"FirstWriteDate\":"); js_put_string(&b, f->first);
@@ -498,7 +503,7 @@ HLE_FORCE_BIG("_ZN2nn3nfp18GetApplicationAreaEPvPmRKNS0_12DeviceHandleEm", "read
 HLE_FORCE_BIG("_ZN2nn3nfp18SetApplicationAreaERKNS0_12DeviceHandleEPKvm", "write the open application area; saved to the amiibo file", Result, h_nfp_SetArea, const NfpDeviceHandle *h, const void *buf, uint64_t sz) {
     nfp_lock(); Result r = nfp_need_mount(h); if (r) return nfp_unlock(r);
     amiibo_area *a = g_nfp_area_open ? nfp_area(g_nfp_area_id) : NULL;
-    if (!a) r = NFP_RES_AREA_NULL; else { nfp_area_set(a, buf, (size_t)sz); amiibo_save(&g_nfp_file); }
+    if (sz > NFP_AREA_SIZE) r = NFP_RES_WRONG_ARGUMENT; else if (!a) r = NFP_RES_AREA_NULL; else { nfp_area_set(a, buf, (size_t)sz); amiibo_save(&g_nfp_file); }
     LOG("nfp: SetApplicationArea %s area %#x, %llu bytes → %#x", g_nfp_file.id, g_nfp_area_id, (unsigned long long)sz, r);
     return nfp_unlock(r);
 }
@@ -506,7 +511,8 @@ typedef struct { uint32_t id, size; const void *data; } NfpAreaCreateInfo;
 static Result nfp_create_area(const NfpDeviceHandle *h, const NfpAreaCreateInfo *ci, int recreate) {
     nfp_lock(); Result r = nfp_need_mount(h); if (r) return nfp_unlock(r);
     amiibo_area *a = nfp_area(ci->id);
-    if (a && !recreate) r = NFP_RES_AREA_EXISTS;
+    if (ci->size > NFP_AREA_SIZE) r = NFP_RES_WRONG_ARGUMENT;
+    else if (a && !recreate) r = NFP_RES_AREA_EXISTS;
     else {
         if (!a) { g_nfp_file.areas = realloc(g_nfp_file.areas, (g_nfp_file.n_areas + 1) * sizeof *g_nfp_file.areas); a = &g_nfp_file.areas[g_nfp_file.n_areas++]; *a = (amiibo_area){ ci->id, NULL, 0 }; }
         nfp_area_set(a, ci->data, ci->size); amiibo_save(&g_nfp_file);

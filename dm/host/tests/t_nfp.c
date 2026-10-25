@@ -55,7 +55,7 @@ static void test_new_file(void) {
 
 static void test_ryujinx_file(void) {
     new_dir();
-    const char *src = "{\"FileVersion\":0,\"TagUuid\":\"AQIDBAUGBwgJ\",\"AmiiboId\":\"" ID "\",\"FirstWriteDate\":\"2024-05-01T12:34:56.789+02:00\",\"LastWriteDate\":\"2024-05-02T08:00:00+02:00\",\"WriteCounter\":3,\"ApplicationAreas\":[{\"ApplicationAreaId\":1234,\"ApplicationArea\":\"3q2+7w==\"}],\"NickName\":null,\"Extra\":{\"a\":[1,2]}}";
+    const char *src = "{\"FileVersion\":1,\"TagUuid\":\"AQIDBAUGBwgJ\",\"AmiiboId\":\"" ID "\",\"FirstWriteDate\":\"2024-05-01T12:34:56.789+02:00\",\"LastWriteDate\":\"2024-05-02T08:00:00+02:00\",\"WriteCounter\":3,\"ApplicationAreas\":[{\"ApplicationAreaId\":1234,\"ApplicationArea\":\"3q2+7w==\"}],\"NickName\":null,\"Extra\":{\"a\":[1,2]}}";
     put_file(ID ".json", src);
     amiibo_file f, g;
     CHECK(amiibo_load(ID, "Wolf Link", &f) == 0, "load");
@@ -71,6 +71,7 @@ static void test_ryujinx_file(void) {
     CHECK(g.n_areas == 1 && g.areas[0].id == 1234 && g.areas[0].size == 4 && !memcmp(g.areas[0].data, "\xde\xad\xbe\xef", 4), "area after save");
     char *t = get_file(ID ".json");
     CHECK(t && strstr(t, "\"Extra\":{\"a\":[1,2]}"), "extra member kept");
+    CHECK(g.version == 1 && t && strstr(t, "\"FileVersion\":1,"), "FileVersion kept");
     amiibo_free(&f); amiibo_free(&g);
 }
 
@@ -141,6 +142,8 @@ static void test_wrong_state(void) {
 static void test_area(void) {
     nfp_start(); h_nfp_Start(&g_h); dm_amiibo_scan(ID, "Wolf Link", 0); h_nfp_Mount(&g_h, 0, 3);
     CHECK(h_nfp_OpenArea(&g_h, 1234) == RES(128), "open a missing area");
+    uint32_t big[4] = {1234, 0xd9, 0, 0}; uint64_t pbig = (uint64_t)(uintptr_t)g_dir; memcpy(&big[2], &pbig, 8);
+    CHECK(h_nfp_CreateArea(&g_h, big) == RES(65) && h_nfp_OpenArea(&g_h, 1234) == RES(128), "create with 0xd9 bytes: wrong argument, no area");
     uint32_t init[4] = {0}; uint64_t pinit = (uint64_t)(uintptr_t)"\x11\x22\x33\x44";
     init[0] = 1234; init[1] = 4; memcpy(&init[2], &pinit, 8);
     CHECK(h_nfp_CreateArea(&g_h, init) == RES_OK, "create");
