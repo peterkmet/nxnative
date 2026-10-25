@@ -4,8 +4,8 @@ Spec: [2026-10-25-virtual-amiibo.md](2026-10-25-virtual-amiibo.md). Host: `make 
 
 ## Menu and picker
 
-- [ ] Before the amiibo rune is open, Amiibo → Scan Amiibo… is disabled.
-- [ ] Open the amiibo rune. The log has `nfp::Initialize: virtual amiibo, folder …_amiibo`. The menu item is enabled; ⌘⇧A opens the picker.
+- [ ] Before the amiibo rune is open, ⌘⇧A opens the picker with the red note "The game is not looking for an amiibo now…"; a double-click on a row keeps the picker open.
+- [ ] Open the amiibo rune. The log has `nfp::Initialize: virtual amiibo, folder …_amiibo`. ⌘⇧A opens the picker without the note.
 - [ ] First open with no `amiibo_tags.json` in the amiibo folder: the table shows "Loading the amiibo list…", then the BotW amiibo (about 27). `amiibo_tags.json` now exists in the amiibo folder.
 - [ ] "Show all amiibo" shows the full list; the search field filters by name and series.
 - [ ] Turn off the network, delete `amiibo_tags.json`, open the picker: it shows "The amiibo list is not available" and the game keeps running.

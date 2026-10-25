@@ -274,13 +274,12 @@ static int amiibo_for_game(NSDictionary *a) {   // gamesSwitch[].gameID (a strin
 }
 @end
 
-@interface DmAmiiboPicker : NSObject <NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSWindowDelegate, NSMenuItemValidation> @end
+@interface DmAmiiboPicker : NSObject <NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSWindowDelegate> @end
 @implementation DmAmiiboPicker {
-    NSPanel *_panel; NSSearchField *_search; NSTableView *_table; NSButton *_all, *_random;
+    NSPanel *_panel; NSSearchField *_search; NSTableView *_table; NSButton *_all, *_random; NSTextField *_note;
     NSArray *_list; int _loading, _closed;   // the amiibo array (nil = not loaded); a load is under way; the panel is closed
     NSArray<NSDictionary *> *_rows;   // the amiibo shown, after the game filter and the search
 }
-- (BOOL)validateMenuItem:(NSMenuItem *)item { (void)item; return dm_amiibo_searching() == 1; }
 - (void)build {
     _panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 480, 420) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow
                                           backing:NSBackingStoreBuffered defer:YES];
@@ -288,13 +287,14 @@ static int amiibo_for_game(NSDictionary *a) {   // gamesSwitch[].gameID (a strin
     _panel.collectionBehavior = NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorMoveToActiveSpace;   // shown over the game in fullscreen too
     NSView *v = _panel.contentView;
     _search = [[NSSearchField alloc] initWithFrame:NSMakeRect(12, 384, 456, 24)]; _search.delegate = self; [v addSubview:_search];
-    NSScrollView *sv = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 44, 456, 332)]; sv.hasVerticalScroller = YES; sv.borderType = NSBezelBorder;
+    NSScrollView *sv = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 66, 456, 310)]; sv.hasVerticalScroller = YES; sv.borderType = NSBezelBorder;
     _table = [[DmAmiiboTable alloc] initWithFrame:sv.bounds];
     for (NSString *c in @[@"Name", @"Series"]) { NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:c]; col.title = c; col.width = 210; [_table addTableColumn:col]; }
     _table.dataSource = self; _table.delegate = self; _table.target = self; _table.doubleAction = @selector(scan:);
     sv.documentView = _table; [v addSubview:sv];
     _all = [NSButton checkboxWithTitle:@"Show all amiibo" target:self action:@selector(refilter:)]; _all.frame = NSMakeRect(12, 12, 200, 20); _all.state = NSControlStateValueOff; [v addSubview:_all];
     _random = [NSButton checkboxWithTitle:@"Random tag UUID" target:nil action:nil]; _random.frame = NSMakeRect(268, 12, 200, 20); _random.state = NSControlStateValueOn; [v addSubview:_random];
+    _note = [NSTextField labelWithString:@"The game is not looking for an amiibo now. Open the game's amiibo screen first."]; _note.frame = NSMakeRect(12, 40, 456, 18); _note.textColor = NSColor.systemRedColor; [v addSubview:_note];
     _panel.initialFirstResponder = _search;
 }
 - (void)open:(id)sender {
@@ -302,6 +302,7 @@ static int amiibo_for_game(NSDictionary *a) {   // gamesSwitch[].gameID (a strin
     if (!_panel) { [self build]; [_panel center]; }
     if (!_list && !_loading) [self load];
     [self refilter:nil];
+    _note.hidden = dm_amiibo_searching() == 1;
     g_picker_opening = 1; _closed = 0;
     [_panel makeKeyAndOrderFront:nil];
 }
@@ -360,10 +361,10 @@ static int amiibo_for_game(NSDictionary *a) {   // gamesSwitch[].gameID (a strin
     if (!_list || row < 0 || row >= (NSInteger)_rows.count) return;
     NSDictionary *a = _rows[(NSUInteger)row];
     NSString *id_ = [amiibo_str(a, @"head") stringByAppendingString:amiibo_str(a, @"tail")];
-    dm_amiibo_scan(id_.UTF8String, amiibo_str(a, @"name").UTF8String, _random.state == NSControlStateValueOn);
+    if (!dm_amiibo_scan(id_.UTF8String, amiibo_str(a, @"name").UTF8String, _random.state == NSControlStateValueOn)) { _note.hidden = NO; return; }   // the game is not searching: the picker stays open with the note
     [_panel close];
 }
-- (void)windowDidBecomeKey:(NSNotification *)n { (void)n; g_picker_opening = 1; if (!g_win.miniaturized) dm_focus_set(1); }   // back from another app: the game is in focus while the picker is key
+- (void)windowDidBecomeKey:(NSNotification *)n { (void)n; g_picker_opening = 1; _note.hidden = dm_amiibo_searching() == 1; if (!g_win.miniaturized) dm_focus_set(1); }   // back from another app: the game is in focus while the picker is key
 - (void)windowDidResignKey:(NSNotification *)n {   // focus state 2 unless the game window or the picker is key on the next main-loop turn (a close makes the game window key)
     (void)n; g_picker_opening = 0;
     dispatch_async(dispatch_get_main_queue(), ^{ if (!self->_closed && !self->_panel.keyWindow && !g_win.keyWindow && !g_win.miniaturized) dm_focus_set(2); });
