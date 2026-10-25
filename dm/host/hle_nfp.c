@@ -1,4 +1,4 @@
-// Virtual amiibo: the amiibo file store (this part) and the nn::nfp take-overs (added later).
+// Virtual amiibo: the amiibo file store and the nn::nfp take-overs, after Ryujinx's virtual amiibo (VirtualAmiibo.cs, INfp.cs): states, events, results and file format.
 // One JSON file per amiibo, <amiibo folder>/<amiibo ID>.json, in the format of Ryujinx's VirtualAmiiboFile
 // (FileVersion, TagUuid, AmiiboId, FirstWriteDate, LastWriteDate, WriteCounter, ApplicationAreas, NickName), so that Ryujinx's files can be used as they are.
 // The folder is $DM_AMIIBO_DIR, else <$DM_SAVE>_amiibo, else ./amiibo. Unknown top-level members are kept verbatim and written back.
@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <pthread.h>
 
 typedef struct { uint32_t id; uint8_t *data; size_t size; } amiibo_area;
 typedef struct { char id[17]; uint8_t uuid[9]; int uuid_len; char first[40], last[40]; uint16_t writes; char nick[64]; amiibo_area *areas; int n_areas; char *extra; } amiibo_file;
@@ -301,3 +302,222 @@ static int amiibo_load(const char *id, const char *default_nick, amiibo_file *f)
     copy_str(f->nick, sizeof f->nick, default_nick ? default_nick : ""); utf8_cut(f->nick, 10);
     return amiibo_save(f);
 }
+
+// ---- nn::nfp take-overs ----
+// From Mario 1.2.1 the game initializes nfp at boot (v0 did not use it). The real SDK would connect to the sm: service, which the host lacks → abort, so the whole family is taken over.
+// The host reports one NFC device on the currently connected controller (same as hle_hid.c). StartDetection searches; dm_amiibo_scan (the front end's picker) places the virtual amiibo,
+// signals the activate event, then the deactivate event 125 ms later, once per scan; Super Mario attaches no events and polls GetDeviceState. The amiibo settings applets return "tag not found".
+// The Legend of Zelda: Breath of the Wild (SDK 20) attaches the activate / deactivate events: without the take-over the SDK's code reads a null pointer at sdk+0x3f2a78
+#define NFP_RES(d) ((uint32_t)(d) << 9 | 115u)   // module 115 (nfp)
+#define NFP_RES_DEVICE_NOT_FOUND NFP_RES(64)
+#define NFP_RES_WRONG_ARGUMENT NFP_RES(65)
+#define NFP_RES_WRONG_STATE NFP_RES(73)
+#define NFP_RES_TAG_NOT_FOUND NFP_RES(97)
+#define NFP_RES_AREA_NULL NFP_RES(128)
+#define NFP_RES_AREA_EXISTS NFP_RES(168)
+enum { NFP_STATE_INIT = 0, NFP_STATE_SEARCH = 1, NFP_STATE_FOUND = 2, NFP_STATE_REMOVED = 3, NFP_STATE_MOUNTED = 4 };
+typedef struct { uint32_t id; uint8_t reserved[4]; } NfpDeviceHandle;
+#define NFP_DEVICE_ID 0x4e465030u   // 'NFP0'
+#define NFP_AREA_SIZE 0xd8u
+uint32_t hle_hid_connected_npad(void);
+uint64_t dm_entropy64(void);
+
+// The nfp state; g_nfp_mu guards all of it (guest threads in the take-overs, the front end in dm_amiibo_scan)
+static pthread_mutex_t g_nfp_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_nfp_state, g_nfp_loaded, g_nfp_area_open;
+static uint32_t g_nfp_area_id;
+static uint8_t g_nfp_uuid[9];
+static char g_nfp_name[64];
+static amiibo_file g_nfp_file;
+static void *g_nfp_ev_act, *g_nfp_ev_deact;
+
+static void nfp_lock(void) { pthread_mutex_lock(&g_nfp_mu); }
+static Result nfp_unlock(Result r) { pthread_mutex_unlock(&g_nfp_mu); return r; }
+static int nfp_bad(const NfpDeviceHandle *h) { return !h || h->id != NFP_DEVICE_ID; }
+// Handle and state check for the calls that need a mounted tag; 0 when the call may go on
+static Result nfp_need_mount(const NfpDeviceHandle *h) { return nfp_bad(h) ? NFP_RES_DEVICE_NOT_FOUND : g_nfp_state != NFP_STATE_MOUNTED ? NFP_RES_WRONG_STATE : 0; }
+static amiibo_area *nfp_area(uint32_t id) {
+    for (int i = 0; i < g_nfp_file.n_areas; i++) if (g_nfp_file.areas[i].id == id) return &g_nfp_file.areas[i];
+    return NULL;
+}
+static void nfp_area_set(amiibo_area *a, const void *buf, size_t n) {
+    free(a->data); a->data = malloc(n ? n : 1); if (n) memcpy(a->data, buf, n); a->size = n;
+}
+static void nfp_date(const char *iso, uint8_t *out) {   // u16 year, u8 month, u8 day
+    int y = 2000, m = 1, d = 1; sscanf(iso, "%4d-%2d-%2d", &y, &m, &d);
+    uint16_t yy = (uint16_t)y; memcpy(out, &yy, 2); out[2] = (uint8_t)m; out[3] = (uint8_t)d;
+}
+static void nfp_uuid_new(uint8_t *u) {
+    uint64_t a = dm_entropy64(), b = dm_entropy64(); memcpy(u, &a, 8); u[8] = (uint8_t)b;
+    u[3] = 0x88 ^ u[0] ^ u[1] ^ u[2]; u[8] = u[3] ^ u[4] ^ u[5] ^ u[6];
+}
+
+typedef struct { void *act, *deact; } nfp_events;
+static void *nfp_event_thread(void *arg) {
+    nfp_events e = *(nfp_events *)arg; free(arg);
+    if (e.act) hle_signal_bound_system_event(e.act);
+    nanosleep(&(struct timespec){0, 125000000}, NULL);
+    if (e.deact) hle_signal_bound_system_event(e.deact);
+    return NULL;
+}
+
+int dm_amiibo_scan(const char *amiibo_id, const char *name, int random_uuid) {
+    nfp_lock();
+    if (g_nfp_state != NFP_STATE_SEARCH) { LOG("nfp: scan %s ignored: the game is not searching for a tag (state %d)", amiibo_id ? amiibo_id : "?", g_nfp_state); return (int)nfp_unlock(0); }
+    if (!amiibo_id_ok(amiibo_id)) { LOG("nfp: scan ignored: bad amiibo ID"); return (int)nfp_unlock(0); }
+    if (g_nfp_loaded) amiibo_free(&g_nfp_file);
+    amiibo_load(amiibo_id, name, &g_nfp_file); g_nfp_loaded = 1;   // on a write error the tag still works from memory
+    if (g_nfp_file.uuid_len != 9) { nfp_uuid_new(g_nfp_file.uuid); g_nfp_file.uuid_len = 9; amiibo_save(&g_nfp_file); }
+    if (random_uuid) nfp_uuid_new(g_nfp_uuid); else memcpy(g_nfp_uuid, g_nfp_file.uuid, 9);
+    copy_str(g_nfp_name, sizeof g_nfp_name, name ? name : "");
+    g_nfp_state = NFP_STATE_FOUND; g_nfp_area_open = 0;
+    nfp_events *e = malloc(sizeof *e); *e = (nfp_events){ g_nfp_ev_act, g_nfp_ev_deact };
+    pthread_t th; if (pthread_create(&th, NULL, nfp_event_thread, e)) { free(e); LOG("[RED] nfp: cannot start the event thread"); } else pthread_detach(th);
+    LOG("nfp: scan %s (%s) → tag found, %s tag UUID", amiibo_id, g_nfp_name, random_uuid ? "random" : "stored");
+    return (int)nfp_unlock(1);
+}
+int dm_amiibo_searching(void) { nfp_lock(); int r = g_nfp_state == NFP_STATE_SEARCH; nfp_unlock(0); return r; }
+
+HLE_FORCE("_ZN2nn3nfp10InitializeEv", "amiibo library init; one NFC device with the virtual amiibo", void, h_nfp_Init, void) {
+    nfp_lock(); g_nfp_state = NFP_STATE_INIT; g_nfp_area_open = 0;
+    LOG("nfp::Initialize: virtual amiibo, folder %s", amiibo_dir()); nfp_unlock(0);
+}
+HLE_FORCE("_ZN2nn3nfp29AttachAvailabilityChangeEventEPNS_2os15SystemEventTypeE", "NFC availability change event; bound to a kernel event, never signalled", void, h_nfp_AttachAvail, void *ev) { hle_bind_system_event(ev, 0); }
+HLE_FORCE("_ZN2nn3nfp11ListDevicesEPNS0_12DeviceHandleEPii", "NFC device list: one device", Result, h_nfp_List, NfpDeviceHandle *out, int *n, int max) {
+    *n = 0; if (max >= 1) { memset(&out[0], 0, sizeof out[0]); out[0].id = NFP_DEVICE_ID; *n = 1; }
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn3nfp9GetNpadIdEPjRKNS0_12DeviceHandleE", "controller the NFC device is on: the one connected now", Result, h_nfp_NpadId, uint32_t *out, const NfpDeviceHandle *h) {
+    if (nfp_bad(h)) return NFP_RES_DEVICE_NOT_FOUND;
+    *out = hle_hid_connected_npad(); return RES_OK;
+}
+HLE_FORCE("_ZN2nn3nfp14StartDetectionERKNS0_12DeviceHandleE", "start tag detection; the picker's scan places the tag", Result, h_nfp_Start, const NfpDeviceHandle *h) {
+    if (nfp_bad(h)) return NFP_RES_DEVICE_NOT_FOUND;
+    nfp_lock(); g_nfp_state = NFP_STATE_SEARCH; g_nfp_area_open = 0; return nfp_unlock(RES_OK);
+}
+HLE_FORCE("_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE", "stop tag detection; the scanned tag is gone", Result, h_nfp_Stop, const NfpDeviceHandle *h) {
+    if (nfp_bad(h)) return NFP_RES_DEVICE_NOT_FOUND;
+    nfp_lock(); g_nfp_state = NFP_STATE_INIT; g_nfp_area_open = 0; return nfp_unlock(RES_OK);
+}
+HLE_FORCE("_ZN2nn3nfp14GetDeviceStateERKNS0_12DeviceHandleE", "device state: initialized / searching / tag found / tag mounted", int, h_nfp_State, const NfpDeviceHandle *h) {
+    (void)h; nfp_lock(); int s = g_nfp_state; nfp_unlock(0); return s;
+}
+HLE_FORCE("_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE", "tag info: the virtual amiibo's 9-byte UUID", Result, h_nfp_TagInfo, void *out, const NfpDeviceHandle *h) {
+    if (nfp_bad(h)) return NFP_RES_DEVICE_NOT_FOUND;
+    nfp_lock();
+    if (g_nfp_state != NFP_STATE_FOUND && g_nfp_state != NFP_STATE_MOUNTED) return nfp_unlock(NFP_RES_WRONG_STATE);
+    uint8_t *o = out; memset(o, 0, 0x58); memcpy(o, g_nfp_uuid, 9); o[0x0a] = 9;
+    uint32_t any = 0xffffffffu; memcpy(o + 0x20, &any, 4); memcpy(o + 0x24, &any, 4);   // protocol, tag type
+    return nfp_unlock(RES_OK);
+}
+HLE_FORCE("_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE", "model info: from the amiibo ID's digits", Result, h_nfp_ModelInfo, void *out, const NfpDeviceHandle *h) {
+    nfp_lock(); Result r = nfp_need_mount(h); if (r) return nfp_unlock(r);
+    unsigned v[5]; const char *id = g_nfp_file.id;
+    sscanf(id, "%4x%2x%2x%4x%2x", &v[0], &v[1], &v[2], &v[3], &v[4]);
+    uint8_t *o = out; memset(o, 0, 0x40);
+    o[0] = (uint8_t)(v[0] >> 8); o[1] = (uint8_t)v[0]; o[2] = (uint8_t)v[1]; o[3] = (uint8_t)v[2];
+    uint16_t model = (uint16_t)v[3]; memcpy(o + 4, &model, 2); o[6] = (uint8_t)v[4];
+    return nfp_unlock(RES_OK);
+}
+static Result nfp_mount(const NfpDeviceHandle *h, int model, int target) {
+    if (nfp_bad(h)) return NFP_RES_DEVICE_NOT_FOUND;
+    if (model != 0 || (target & 3) == 0) return NFP_RES_WRONG_ARGUMENT;
+    nfp_lock();
+    if (g_nfp_state != NFP_STATE_FOUND && g_nfp_state != NFP_STATE_MOUNTED) { LOG("nfp: Mount → no tag (state %d)", g_nfp_state); return nfp_unlock(NFP_RES_WRONG_STATE); }
+    g_nfp_state = NFP_STATE_MOUNTED; LOG("nfp: Mount %s → ok", g_nfp_file.id);
+    return nfp_unlock(RES_OK);
+}
+HLE_FORCE_BIG("_ZN2nn3nfp5MountERKNS0_12DeviceHandleENS0_9ModelTypeENS0_11MountTargetE", "mount the virtual amiibo", Result, h_nfp_Mount, const NfpDeviceHandle *h, int model, int target) { return nfp_mount(h, model, target); }
+HLE_FORCE_BIG("_ZN2nn3nfp5MountERKNS0_12DeviceHandleENS0_9ModelTypeE", "mount the virtual amiibo (two arguments: all targets)", Result, h_nfp_Mount2, const NfpDeviceHandle *h, int model) { return nfp_mount(h, model, 3); }
+HLE_FORCE("_ZN2nn3nfp19AttachActivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE", "tag placed event; signalled by the host after a scan", Result, h_nfp_AttachAct, void *ev, const NfpDeviceHandle *h) {
+    if (nfp_bad(h)) return NFP_RES_DEVICE_NOT_FOUND;
+    hle_bind_system_event(ev, 0); nfp_lock(); g_nfp_ev_act = ev; return nfp_unlock(RES_OK);
+}
+HLE_FORCE("_ZN2nn3nfp21AttachDeactivateEventEPNS_2os15SystemEventTypeERKNS0_12DeviceHandleE", "tag removed event; signalled by the host 125 ms after a scan", Result, h_nfp_AttachDeact, void *ev, const NfpDeviceHandle *h) {
+    if (nfp_bad(h)) return NFP_RES_DEVICE_NOT_FOUND;
+    hle_bind_system_event(ev, 0); nfp_lock(); g_nfp_ev_deact = ev; return nfp_unlock(RES_OK);
+}
+HLE_FORCE("_ZN2nn3nfp7UnmountERKNS0_12DeviceHandleE", "unmount the virtual amiibo", Result, h_nfp_Unmount, const NfpDeviceHandle *h) {
+    if (nfp_bad(h)) return NFP_RES_DEVICE_NOT_FOUND;
+    nfp_lock();
+    if (g_nfp_state != NFP_STATE_FOUND && g_nfp_state != NFP_STATE_MOUNTED) { LOG("nfp: Unmount → no tag (state %d)", g_nfp_state); return nfp_unlock(NFP_RES_WRONG_STATE); }
+    g_nfp_state = NFP_STATE_FOUND; g_nfp_area_open = 0; LOG("nfp: Unmount %s → ok", g_nfp_file.id);
+    return nfp_unlock(RES_OK);
+}
+HLE_FORCE("_ZN2nn3nfp13GetCommonInfoEPNS0_10CommonInfoERKNS0_12DeviceHandleE", "common info: the amiibo file's last write date and write counter", Result, h_nfp_CommonInfo, void *out, const NfpDeviceHandle *h) {
+    nfp_lock(); Result r = nfp_need_mount(h); if (r) return nfp_unlock(r);
+    uint8_t *o = out; memset(o, 0, 0x40); nfp_date(g_nfp_file.last, o);
+    uint16_t writes = g_nfp_file.writes, version = 1; uint32_t size = NFP_AREA_SIZE;
+    memcpy(o + 4, &writes, 2); memcpy(o + 6, &version, 2); memcpy(o + 8, &size, 4);
+    return nfp_unlock(RES_OK);
+}
+// UTF-8 → UTF-16, at most n units without the terminator; out has room for n + 1
+static void nfp_utf16(uint16_t *out, int n, const char *s) {
+    int k = 0; const unsigned char *p = (const unsigned char *)s;
+    while (*p && k < n) {
+        uint32_t c = *p++; int more = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
+        if (more) c &= 0x3f >> more;
+        while (more-- && (*p & 0xc0) == 0x80) c = c << 6 | (*p++ & 63);
+        out[k++] = c > 0xffff ? 0xfffd : (uint16_t)c;
+    }
+    out[k] = 0;
+}
+HLE_FORCE("_ZN2nn3nfp15GetRegisterInfoEPNS0_12RegisterInfoERKNS0_12DeviceHandleE", "register info: the default Mii with the user's nickname, the amiibo's nickname", Result, h_nfp_RegInfo, void *out, const NfpDeviceHandle *h) {
+    nfp_lock(); Result r = nfp_need_mount(h); if (r) return nfp_unlock(r);
+    uint8_t *o = out; memset(o, 0, 0x100);
+    dm_mii_default_charinfo(o);
+    const char *nick = getenv("DM_NICK"); uint16_t mii_nick[11];
+    nfp_utf16(mii_nick, 10, nick ? nick : "Player"); memcpy(o + 0x10, mii_nick, sizeof mii_nick);   // CharInfo nickname, UTF-16
+    nfp_date(g_nfp_file.first, o + 0x58);
+    snprintf((char *)o + 0x5c, 0x29, "%s", g_nfp_file.nick);   // amiibo nickname, UTF-8; font region 0 at 0x85
+    return nfp_unlock(RES_OK);
+}
+HLE_FORCE("_ZN2nn3nfp8GetStateEv", "amiibo library state: initialized (1)", int, h_nfp_LibState, void) { return 1; }
+HLE_FORCE("_ZN2nn3nfp8FinalizeEv", "amiibo library finalize: the scanned tag is gone", void, h_nfp_Fini, void) {
+    nfp_lock(); g_nfp_state = NFP_STATE_INIT; g_nfp_area_open = 0;
+    if (g_nfp_loaded) amiibo_free(&g_nfp_file);
+    g_nfp_loaded = 0; nfp_unlock(0);
+}
+HLE_FORCE_BIG("_ZN2nn3nfp5FlushERKNS0_12DeviceHandleE", "flush tag: the host writes the amiibo file on each change; nothing to do", Result, h_nfp_Flush, const NfpDeviceHandle *h) {
+    nfp_lock(); return nfp_unlock(nfp_need_mount(h));
+}
+HLE_FORCE_BIG("_ZN2nn3nfp19OpenApplicationAreaERKNS0_12DeviceHandleEj", "open the virtual amiibo's application area", Result, h_nfp_OpenArea, const NfpDeviceHandle *h, uint32_t id) {
+    nfp_lock(); Result r = nfp_need_mount(h); if (r) return nfp_unlock(r);
+    if (!nfp_area(id)) r = NFP_RES_AREA_NULL; else { g_nfp_area_open = 1; g_nfp_area_id = id; }
+    LOG("nfp: OpenApplicationArea %s area %#x → %#x", g_nfp_file.id, id, r);
+    return nfp_unlock(r);
+}
+HLE_FORCE_BIG("_ZN2nn3nfp18GetApplicationAreaEPvPmRKNS0_12DeviceHandleEm", "read the open application area: at most the buffer size", Result, h_nfp_GetArea, void *buf, uint64_t *n, const NfpDeviceHandle *h, uint64_t sz) {
+    if (n) *n = 0;
+    nfp_lock(); Result r = nfp_need_mount(h); if (r) return nfp_unlock(r);
+    amiibo_area *a = g_nfp_area_open ? nfp_area(g_nfp_area_id) : NULL;
+    if (!a || !a->size) return nfp_unlock(NFP_RES_AREA_NULL);
+    size_t k = a->size < sz ? a->size : (size_t)sz; memcpy(buf, a->data, k); if (n) *n = k;
+    return nfp_unlock(RES_OK);
+}
+HLE_FORCE_BIG("_ZN2nn3nfp18SetApplicationAreaERKNS0_12DeviceHandleEPKvm", "write the open application area; saved to the amiibo file", Result, h_nfp_SetArea, const NfpDeviceHandle *h, const void *buf, uint64_t sz) {
+    nfp_lock(); Result r = nfp_need_mount(h); if (r) return nfp_unlock(r);
+    amiibo_area *a = g_nfp_area_open ? nfp_area(g_nfp_area_id) : NULL;
+    if (!a) r = NFP_RES_AREA_NULL; else { nfp_area_set(a, buf, (size_t)sz); amiibo_save(&g_nfp_file); }
+    LOG("nfp: SetApplicationArea %s area %#x, %llu bytes → %#x", g_nfp_file.id, g_nfp_area_id, (unsigned long long)sz, r);
+    return nfp_unlock(r);
+}
+typedef struct { uint32_t id, size; const void *data; } NfpAreaCreateInfo;
+static Result nfp_create_area(const NfpDeviceHandle *h, const NfpAreaCreateInfo *ci, int recreate) {
+    nfp_lock(); Result r = nfp_need_mount(h); if (r) return nfp_unlock(r);
+    amiibo_area *a = nfp_area(ci->id);
+    if (a && !recreate) r = NFP_RES_AREA_EXISTS;
+    else {
+        if (!a) { g_nfp_file.areas = realloc(g_nfp_file.areas, (g_nfp_file.n_areas + 1) * sizeof *g_nfp_file.areas); a = &g_nfp_file.areas[g_nfp_file.n_areas++]; *a = (amiibo_area){ ci->id, NULL, 0 }; }
+        nfp_area_set(a, ci->data, ci->size); amiibo_save(&g_nfp_file);
+    }
+    LOG("nfp: %sApplicationArea %s area %#x, %u bytes → %#x", recreate ? "Recreate" : "Create", g_nfp_file.id, ci->id, ci->size, r);
+    return nfp_unlock(r);
+}
+HLE_FORCE_BIG("_ZN2nn3nfp21CreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE", "create an application area on the virtual amiibo", Result, h_nfp_CreateArea, const NfpDeviceHandle *h, const void *info) { return nfp_create_area(h, info, 0); }
+HLE_FORCE_BIG("_ZN2nn3nfp23RecreateApplicationAreaERKNS0_12DeviceHandleERKNS0_25ApplicationAreaCreateInfoE", "replace an application area on the virtual amiibo", Result, h_nfp_RecreateArea, const NfpDeviceHandle *h, const void *info) { return nfp_create_area(h, info, 1); }
+// The amiibo settings applets are out of scope: no tag found
+HLE_FORCE("_ZN2nn3nfp13StartRestorerEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE", "amiibo restorer applet: no tag", Result, h_nfp_Restorer, NfpDeviceHandle *h, const void *p, const void *tag) { (void)h; (void)p; (void)tag; return NFP_RES_TAG_NOT_FOUND; }
+HLE_FORCE("_ZN2nn3nfp19StartGameDataEraserEPNS0_12DeviceHandleERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE", "amiibo game data eraser applet: no tag", Result, h_nfp_Eraser, NfpDeviceHandle *h, const void *p, const void *tag) { (void)h; (void)p; (void)tag; return NFP_RES_TAG_NOT_FOUND; }
+HLE_FORCE("_ZN2nn3nfp29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoE", "amiibo nickname and owner settings applet: no tag", Result, h_nfp_Nick, NfpDeviceHandle *h, uint8_t *changed, void *reg, const void *p, const void *tag) { (void)h; (void)reg; (void)p; (void)tag; if (changed) *changed = 0; return NFP_RES_TAG_NOT_FOUND; }
+HLE_FORCE("_ZN2nn3nfp29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_12RegisterInfoERKNS0_24AmiiboSettingsStartParamERKNS0_7TagInfoERKS4_", "amiibo nickname and owner settings applet (with the old register info): no tag", Result, h_nfp_Nick2, NfpDeviceHandle *h, uint8_t *changed, void *reg, const void *p, const void *tag, const void *old) { (void)h; (void)reg; (void)p; (void)tag; (void)old; if (changed) *changed = 0; return NFP_RES_TAG_NOT_FOUND; }
