@@ -28,7 +28,7 @@
 - Deviation from the spec: the test stubs go inline in `t_nfp.c` (the pattern of `tests/t_hid.c:9-25`), not into a separate `t_nfp_stub.c`.
 - Commits: plain `git commit` with the checkout's git config (the fork owner's identity). AGENTS.md:29's `-c user.name=seedds` form is the upstream author's identity and does not apply in this fork; the plan approval is the request to commit.
 - File-touching take-overs (Mount, the application-area calls, Flush) and `dm_amiibo_scan`'s file load use `HLE_FORCE_BIG` (`hle.h:41`, as `hle_fs.c:22`) where they are take-overs; the JSON parser keeps its buffers on the heap.
-- Weakened assertions: none. No task removes or loosens an existing assertion.
+- Weakened assertions: none. No task removes or loosens an existing assertion. Approved by the user on 2026-10-25.
 
 ## Review Focus
 
