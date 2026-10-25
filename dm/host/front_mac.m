@@ -241,7 +241,7 @@ static void pads_start(void) {
 @end
 
 // Amiibo picker (Amiibo → Scan Amiibo…, ⌘⇧A): a panel with Ryujinx's tags.json list (cached as amiibo_tags.json); double-click or Return calls dm_amiibo_scan
-static int g_picker_opening;   // main thread: set while the picker is open, so the game window's resign-key observer does not report focus state 2
+static int g_picker_opening;   // main thread: set while the picker opens or is key, so the game window's resign-key observer does not report focus state 2
 static NSString *amiibo_folder(void) {   // the same rule as hle_nfp.c amiibo_dir: $DM_AMIIBO_DIR, else <$DM_SAVE>_amiibo, else ./amiibo
     const char *e = getenv("DM_AMIIBO_DIR"), *s = getenv("DM_SAVE"); char dir[1024];
     if (e && *e) snprintf(dir, sizeof dir, "%s", e);
@@ -277,7 +277,7 @@ static int amiibo_for_game(NSDictionary *a) {   // gamesSwitch[].gameID (a strin
 @interface DmAmiiboPicker : NSObject <NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSWindowDelegate, NSMenuItemValidation> @end
 @implementation DmAmiiboPicker {
     NSPanel *_panel; NSSearchField *_search; NSTableView *_table; NSButton *_all, *_random;
-    NSArray *_list; int _loading;   // the amiibo array (nil = not loaded); a load is under way
+    NSArray *_list; int _loading, _closed;   // the amiibo array (nil = not loaded); a load is under way; the panel is closed
     NSArray<NSDictionary *> *_rows;   // the amiibo shown, after the game filter and the search
 }
 - (BOOL)validateMenuItem:(NSMenuItem *)item { (void)item; return dm_amiibo_searching() == 1; }
@@ -302,7 +302,7 @@ static int amiibo_for_game(NSDictionary *a) {   // gamesSwitch[].gameID (a strin
     if (!_panel) { [self build]; [_panel center]; }
     if (!_list && !_loading) [self load];
     [self refilter:nil];
-    g_picker_opening = 1;
+    g_picker_opening = 1; _closed = 0;
     [_panel makeKeyAndOrderFront:nil];
 }
 - (void)load {   // the cache, or the download when no cache exists; a failed load is tried again when the picker opens again
@@ -363,8 +363,13 @@ static int amiibo_for_game(NSDictionary *a) {   // gamesSwitch[].gameID (a strin
     dm_amiibo_scan(id_.UTF8String, amiibo_str(a, @"name").UTF8String, _random.state == NSControlStateValueOn);
     [_panel close];
 }
-- (void)windowWillClose:(NSNotification *)n {   // the game window is key again: its become-key observer resumes the input and reports focus state 1
+- (void)windowDidBecomeKey:(NSNotification *)n { (void)n; g_picker_opening = 1; if (!g_win.miniaturized) dm_focus_set(1); }   // back from another app: the game is in focus while the picker is key
+- (void)windowDidResignKey:(NSNotification *)n {   // focus state 2 unless the game window or the picker is key on the next main-loop turn (a close makes the game window key)
     (void)n; g_picker_opening = 0;
+    dispatch_async(dispatch_get_main_queue(), ^{ if (!self->_closed && !self->_panel.keyWindow && !g_win.keyWindow && !g_win.miniaturized) dm_focus_set(2); });
+}
+- (void)windowWillClose:(NSNotification *)n {   // the game window is key again: its become-key observer resumes the input and reports focus state 1
+    (void)n; g_picker_opening = 0; _closed = 1;
     dispatch_async(dispatch_get_main_queue(), ^{ [g_win makeKeyAndOrderFront:nil]; });
 }
 @end
