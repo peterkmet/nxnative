@@ -6,7 +6,7 @@ User-visible changes of this fork against [seedds/nxnative](https://github.com/s
 
 ### Added
 
-- Virtual amiibo on the Mac host. **Amiibo → Scan Amiibo…** (⌘⇧A) opens a picker with the amiibo of the running game; a double-click or Return scans the selected amiibo. The game reads it as a figure on the controller. "Show all amiibo" lists every amiibo; "Random tag UUID" (on by default) lets a game give its daily amiibo reward again.
+- Virtual amiibo on the Mac host. **Amiibo → Scan Amiibo…** (⌘⇧A) opens a picker with the amiibo of the running game; a double-click or Return scans the selected amiibo. The game reads it as a figure on the controller. "Show all amiibo" lists every amiibo; "Random tag UUID" (on by default) lets a game that limits the reward per tag UUID (Breath of the Wild) give it again; Echoes of Wisdom limits it per amiibo, so the option does not repeat its reward.
 - The picker downloads Ryujinx's amiibo list the first time it opens and keeps it as `amiibo_tags.json` in the amiibo folder. No other network access.
 - Data that a game writes to an amiibo stays in `<amiibo ID>.json` in the amiibo folder (`DM_AMIIBO_DIR`, default `<DM_SAVE>_amiibo`), in Ryujinx's amiibo file format. Files can be copied between Ryujinx and the host.
 - When the game is not looking for an amiibo, the picker says so and keeps the choice open.
