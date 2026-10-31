@@ -2,6 +2,12 @@
 
 User-visible changes of this fork against [seedds/nxnative](https://github.com/seedds/nxnative).
 
+## 2026-10-31
+
+### Changed
+
+- The amiibo picker is now the **Amiibo** panel, built like the Cheats panel. **Amiibo → Show Amiibo Window** (⌘⇧A) shows it beside the game window, where it stays open after a scan and keeps its place and size. The game keeps the keyboard and the controllers; the panel takes the keyboard only while you type in its search field. The header says whether the game is looking for an amiibo. **Scan** (or a double-click, or Return in the search field) scans the selected amiibo. **Reload List** and **Open Folder** are at the bottom.
+
 ## 2026-10-26
 
 ### Added

@@ -241,8 +241,8 @@ static void pads_start(void) {
 - (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; }
 @end
 
-// Amiibo picker (Amiibo → Scan Amiibo…, ⌘⇧A): a panel with Ryujinx's tags.json list (cached as amiibo_tags.json); double-click or Return calls dm_amiibo_scan
-static int g_picker_opening;   // main thread: set while the picker opens or is key, so the game window's resign-key observer does not report focus state 2
+// Amiibo panel helpers (DmAmiiboPanel below): Ryujinx's tags.json list, cached as amiibo_tags.json
+static int g_picker_opening;   // main thread: set while the Amiibo panel is key, so the game window's resign-key observer does not report focus state 2
 static NSString *amiibo_folder(void) {   // the same rule as hle_nfp.c amiibo_dir: $DM_AMIIBO_DIR, else <$DM_SAVE>_amiibo, else ./amiibo
     const char *e = getenv("DM_AMIIBO_DIR"), *s = getenv("DM_SAVE"); char dir[1024];
     if (e && *e) snprintf(dir, sizeof dir, "%s", e);
@@ -268,114 +268,6 @@ static int amiibo_for_game(NSDictionary *a) {   // gamesSwitch[].gameID (a strin
     return 0;
 }
 
-@interface DmAmiiboTable : NSTableView @end
-@implementation DmAmiiboTable
-- (void)keyDown:(NSEvent *)e {   // Return scans the selected row (the double-click action)
-    if (e.keyCode == 36 || e.keyCode == 76) [NSApp sendAction:self.doubleAction to:self.target from:nil]; else [super keyDown:e];
-}
-@end
-
-@interface DmAmiiboPicker : NSObject <NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSWindowDelegate> @end
-@implementation DmAmiiboPicker {
-    NSPanel *_panel; NSSearchField *_search; NSTableView *_table; NSButton *_all, *_random; NSTextField *_note;
-    NSArray *_list; int _loading, _closed;   // the amiibo array (nil = not loaded); a load is under way; the panel is closed
-    NSArray<NSDictionary *> *_rows;   // the amiibo shown, after the game filter and the search
-}
-- (void)build {
-    _panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 480, 420) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow
-                                          backing:NSBackingStoreBuffered defer:YES];
-    _panel.title = @"Scan Amiibo"; _panel.releasedWhenClosed = NO; _panel.delegate = self;
-    _panel.collectionBehavior = NSWindowCollectionBehaviorFullScreenAuxiliary | NSWindowCollectionBehaviorMoveToActiveSpace;   // shown over the game in fullscreen too
-    NSView *v = _panel.contentView;
-    _search = [[NSSearchField alloc] initWithFrame:NSMakeRect(12, 384, 456, 24)]; _search.delegate = self; [v addSubview:_search];
-    NSScrollView *sv = [[NSScrollView alloc] initWithFrame:NSMakeRect(12, 66, 456, 310)]; sv.hasVerticalScroller = YES; sv.borderType = NSBezelBorder;
-    _table = [[DmAmiiboTable alloc] initWithFrame:sv.bounds];
-    for (NSString *c in @[@"Name", @"Series"]) { NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:c]; col.title = c; col.width = 210; [_table addTableColumn:col]; }
-    _table.dataSource = self; _table.delegate = self; _table.target = self; _table.doubleAction = @selector(scan:);
-    sv.documentView = _table; [v addSubview:sv];
-    _all = [NSButton checkboxWithTitle:@"Show all amiibo" target:self action:@selector(refilter:)]; _all.frame = NSMakeRect(12, 12, 200, 20); _all.state = NSControlStateValueOff; [v addSubview:_all];
-    _random = [NSButton checkboxWithTitle:@"Random tag UUID" target:nil action:nil]; _random.frame = NSMakeRect(268, 12, 200, 20); _random.state = NSControlStateValueOn; [v addSubview:_random];
-    _note = [NSTextField labelWithString:@"The game is not looking for an amiibo now. Open the game's amiibo screen first."]; _note.frame = NSMakeRect(12, 40, 456, 18); _note.textColor = NSColor.systemRedColor; [v addSubview:_note];
-    _panel.initialFirstResponder = _search;
-}
-- (void)open:(id)sender {
-    (void)sender;
-    if (!_panel) { [self build]; [_panel center]; }
-    if (!_list && !_loading) [self load];
-    [self refilter:nil];
-    _note.hidden = dm_amiibo_searching() == 1;
-    g_picker_opening = 1; _closed = 0;
-    [_panel makeKeyAndOrderFront:nil];
-}
-- (void)load {   // the cache, or the download when no cache exists; a failed load is tried again when the picker opens again
-    NSString *path = [amiibo_folder() stringByAppendingPathComponent:@"amiibo_tags.json"];
-    if ([NSFileManager.defaultManager fileExistsAtPath:path]) {
-        _list = amiibo_list_parse([NSData dataWithContentsOfFile:path]);
-        if (!_list) LOG("amiibo: the list %s is not valid (delete it to download it again)", path.UTF8String);
-        return;
-    }
-    _loading = 1; LOG("amiibo: downloading the amiibo list");
-    NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Ryubing/Nfc/refs/heads/main/tags.json"];
-    [[NSURLSession.sharedSession dataTaskWithURL:url completionHandler:^(NSData *d, NSURLResponse *r, NSError *err) {
-        long status = [r isKindOfClass:NSHTTPURLResponse.class] ? (long)((NSHTTPURLResponse *)r).statusCode : 0;
-        NSArray *list = status == 200 ? amiibo_list_parse(d) : nil;
-        if (list) {   // the cache is written to a temp file and renamed only after the reply parses
-            NSString *tmp = [path stringByAppendingString:@".tmp"];
-            if (![d writeToFile:tmp atomically:NO] || rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation)) { LOG("amiibo: cannot write %s (errno=%d)", path.UTF8String, errno); unlink(tmp.fileSystemRepresentation); }
-        }
-        LOG("amiibo: list download %s (HTTP %ld, %lu bytes%s%s)", list ? "done" : "failed", status, (unsigned long)d.length, err ? ", " : "", err ? err.localizedDescription.UTF8String : "");
-        dispatch_async(dispatch_get_main_queue(), ^{ self->_loading = 0; self->_list = list; [self refilter:nil]; });
-    }] resume];
-}
-- (void)refilter:(id)sender {
-    (void)sender;
-    NSString *q = _search.stringValue; int all = _all.state == NSControlStateValueOn;
-    NSMutableArray *rows = [NSMutableArray new];
-    for (id a in _list) {
-        if (![a isKindOfClass:NSDictionary.class] || amiibo_str(a, @"head").length != 8 || amiibo_str(a, @"tail").length != 8) continue;
-        if (!all && !amiibo_for_game(a)) continue;
-        NSStringCompareOptions o = NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch;
-        if (q.length && [amiibo_str(a, @"name") rangeOfString:q options:o].location == NSNotFound && [amiibo_str(a, @"amiiboSeries") rangeOfString:q options:o].location == NSNotFound) continue;
-        [rows addObject:a];
-    }
-    _rows = rows; [_table reloadData];
-    if (_rows.count && _table.selectedRow < 0) [_table selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
-}
-- (void)controlTextDidChange:(NSNotification *)n { (void)n; [self refilter:nil]; }
-- (BOOL)control:(NSControl *)c textView:(NSTextView *)tv doCommandBySelector:(SEL)cmd {   // Return in the search field scans the selected row
-    (void)c; (void)tv;
-    if (cmd != @selector(insertNewline:)) return NO;
-    [self scan:nil]; return YES;
-}
-- (NSInteger)numberOfRowsInTableView:(NSTableView *)t { (void)t; return _list ? (NSInteger)_rows.count : 1; }   // no list: one row with the state
-- (NSView *)tableView:(NSTableView *)t viewForTableColumn:(NSTableColumn *)col row:(NSInteger)row {
-    NSTextField *f = [t makeViewWithIdentifier:col.identifier owner:self];
-    if (!f) { f = [NSTextField labelWithString:@""]; f.identifier = col.identifier; f.lineBreakMode = NSLineBreakByTruncatingTail; }
-    int name = [col.identifier isEqualToString:@"Name"];
-    if (!_list) f.stringValue = !name ? @"" : _loading ? @"Loading the amiibo list…" : @"The amiibo list is not available";
-    else f.stringValue = amiibo_str(_rows[(NSUInteger)row], name ? @"name" : @"amiiboSeries");
-    return f;
-}
-- (BOOL)tableView:(NSTableView *)t shouldSelectRow:(NSInteger)row { (void)t; (void)row; return _list != nil; }
-- (void)scan:(id)sender {
-    NSInteger row = sender == _table && _table.clickedRow >= 0 ? _table.clickedRow : _table.selectedRow;
-    if (!_list || row < 0 || row >= (NSInteger)_rows.count) return;
-    NSDictionary *a = _rows[(NSUInteger)row];
-    NSString *id_ = [amiibo_str(a, @"head") stringByAppendingString:amiibo_str(a, @"tail")];
-    if (!dm_amiibo_scan(id_.UTF8String, amiibo_str(a, @"name").UTF8String, _random.state == NSControlStateValueOn)) { _note.hidden = NO; return; }   // the game is not searching: the picker stays open with the note
-    [_panel close];
-}
-- (void)windowDidBecomeKey:(NSNotification *)n { (void)n; g_picker_opening = 1; _note.hidden = dm_amiibo_searching() == 1; if (!g_win.miniaturized) dm_focus_set(1); }   // back from another app: the game is in focus while the picker is key
-- (void)windowDidResignKey:(NSNotification *)n {   // focus state 2 unless the game window or the picker is key on the next main-loop turn (a close makes the game window key)
-    (void)n; g_picker_opening = 0;
-    dispatch_async(dispatch_get_main_queue(), ^{ if (!self->_closed && !self->_panel.keyWindow && !g_win.keyWindow && !g_win.miniaturized) dm_focus_set(2); });
-}
-- (void)windowWillClose:(NSNotification *)n {   // the game window is key again: its become-key observer resumes the input and reports focus state 1
-    (void)n; g_picker_opening = 0; _closed = 1;
-    dispatch_async(dispatch_get_main_queue(), ^{ [g_win makeKeyAndOrderFront:nil]; });
-}
-@end
-static DmAmiiboPicker *g_picker;
 
 typedef struct { void (*fn)(void); } guest_arg;
 static void *guest_tramp(void *p) {
@@ -1232,6 +1124,222 @@ static NSArray<NSURL *> *found_cheat_files(NSString *build) {
 }
 @end
 
+// The Amiibo panel (Amiibo → Show Amiibo Window, ⌘⇧A): a utility NSPanel beside the game window, built like the Cheats
+// panel. It never takes the key window from the game for a click (becomesKeyOnlyIfNeeded, shown with orderFront), so the
+// game keeps the keyboard and the controllers; it becomes key only while the player types in its search field, and Return
+// (scan the selected row) or Escape there hands the keyboard back. A scan leaves the panel open. Created once lazily,
+// closed only to hide (its place and size survive in the frame autosave "DmAmiiboPanel"). Top to bottom:
+//   - the header: whether the game is looking for an amiibo now;
+//   - Show all amiibo, Random tag UUID and the search field;
+//   - the table of names and series (the running game's amiibo, or all of them);
+//   - a details line (the selected amiibo, or the last scan);
+//   - Scan, Reload List and Open Folder.
+// A ~1 s timer keeps the header and Scan in step with the game while the panel is visible
+@interface DmAmiiboNSPanel : NSPanel @end
+@implementation DmAmiiboNSPanel
+- (BOOL)canBecomeKeyWindow { return YES; }   // the search field needs the keyboard
+@end
+
+@interface DmAmiiboPanel : NSObject <NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSWindowDelegate>
+- (void)show:(id)sender;   // create the panel if needed, order it front (not key) and refresh
+@end
+@implementation DmAmiiboPanel {
+    NSPanel *_panel; NSTextField *_header, *_details; NSSearchField *_search; NSTableView *_table; NSButton *_all, *_random, *_scan;
+    NSArray *_list; int _loading;          // the amiibo array (nil = not loaded); a load is under way
+    NSArray<NSDictionary *> *_rows;        // the amiibo shown, after the game filter and the search
+    NSString *_last;                       // the details text of the last scan, kept until the selection changes
+    NSTimer *_timer;                       // ~1 s, from show until the close
+}
+- (void)makePanel {
+    _panel = [[DmAmiiboNSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 480, 460)
+                                                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable | NSWindowStyleMaskUtilityWindow
+                                                  backing:NSBackingStoreBuffered defer:NO];
+    _panel.title = @"Amiibo";
+    _panel.releasedWhenClosed = NO;         // the close button only hides (windowShouldClose)
+    _panel.floatingPanel = YES;             // above the game window
+    _panel.becomesKeyOnlyIfNeeded = YES;    // a click never takes the key window: the game keeps keyboard and controllers
+    _panel.collectionBehavior = NSWindowCollectionBehaviorFullScreenAuxiliary;   // shows over the fullscreen game too
+    _panel.minSize = NSMakeSize(360, 260);
+    _panel.delegate = self;
+    NSView *content = _panel.contentView;
+
+    _header = [NSTextField labelWithString:@""];
+    _header.lineBreakMode = NSLineBreakByTruncatingTail;
+    [_header setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    _all = [NSButton checkboxWithTitle:@"Show all amiibo" target:self action:@selector(refilter:)];
+    _random = [NSButton checkboxWithTitle:@"Random tag UUID" target:nil action:nil]; _random.state = NSControlStateValueOn;
+    _search = [NSSearchField new];
+    _search.placeholderString = @"Search"; _search.delegate = self; _search.sendsSearchStringImmediately = YES;
+    [_search setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    NSStackView *tools = panel_hrow(@[_all, _random, _search]);
+    NSStackView *top = [NSStackView stackViewWithViews:@[_header, tools]];
+    top.orientation = NSUserInterfaceLayoutOrientationVertical; top.alignment = NSLayoutAttributeLeading; top.spacing = 6;
+    top.translatesAutoresizingMaskIntoConstraints = NO;
+
+    NSScrollView *sv = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    sv.hasVerticalScroller = YES; sv.autohidesScrollers = YES; sv.translatesAutoresizingMaskIntoConstraints = NO;
+    _table = [[NSTableView alloc] initWithFrame:NSZeroRect];
+    for (NSString *c in @[@"Name", @"Series"]) { NSTableColumn *col = [[NSTableColumn alloc] initWithIdentifier:c]; col.title = c; col.width = 220; [_table addTableColumn:col]; }
+    _table.columnAutoresizingStyle = NSTableViewUniformColumnAutoresizingStyle;
+    _table.dataSource = self; _table.delegate = self; _table.target = self; _table.doubleAction = @selector(scan:);
+    sv.documentView = _table;
+
+    _details = [NSTextField wrappingLabelWithString:@""];
+    _details.translatesAutoresizingMaskIntoConstraints = NO;
+    _details.selectable = NO;   // a selectable label would make the panel key on a click and keep the keyboard from the game
+    _details.font = [NSFont monospacedSystemFontOfSize:NSFont.smallSystemFontSize weight:NSFontWeightRegular];
+    _details.maximumNumberOfLines = 3;
+    [_details setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+
+    _scan = panel_button(@"Scan", self, @selector(scan:));
+    NSStackView *bottom = panel_hrow(@[_scan, panel_button(@"Reload List", self, @selector(reloadList:)), panel_button(@"Open Folder", self, @selector(openFolder:))]);
+    for (NSView *v in @[top, sv, _details, bottom]) [content addSubview:v];
+    [NSLayoutConstraint activateConstraints:@[
+        [top.topAnchor constraintEqualToAnchor:content.topAnchor constant:10],
+        [top.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:8],
+        [top.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-8],
+        [_header.trailingAnchor constraintEqualToAnchor:top.trailingAnchor],
+        [tools.trailingAnchor constraintEqualToAnchor:top.trailingAnchor],
+        [sv.topAnchor constraintEqualToAnchor:top.bottomAnchor constant:8],
+        [sv.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+        [sv.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+        [sv.bottomAnchor constraintEqualToAnchor:_details.topAnchor constant:-6],
+        [_details.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:8],
+        [_details.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-8],
+        [_details.bottomAnchor constraintEqualToAnchor:bottom.topAnchor constant:-6],
+        [bottom.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:8],
+        [bottom.trailingAnchor constraintLessThanOrEqualToAnchor:content.trailingAnchor constant:-8],
+        [bottom.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-8],
+    ]];
+    if (![_panel setFrameUsingName:@"DmAmiiboPanel"] && g_win) {   // first use: left of the game window (the Cheats panel opens on its right)
+        NSRect g = g_win.frame, f = _panel.frame;
+        [_panel setFrameOrigin:NSMakePoint(NSMinX(g) - 8 - f.size.width, NSMaxY(g) - f.size.height)];
+    }
+    _panel.frameAutosaveName = @"DmAmiiboPanel";
+}
+- (void)show:(id)sender {
+    (void)sender;
+    if (!_panel) [self makePanel];
+    if (!_list && !_loading) [self load];
+    [_panel orderFront:self];   // not key: the game window stays key
+    [self refilter:nil];
+    [self refresh];
+    if (!_timer.isValid) _timer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(refresh) userInfo:nil repeats:YES];
+}
+- (void)load {   // the cache, or the download when no cache exists; a failed load is tried again on show or Reload List
+    NSString *path = [amiibo_folder() stringByAppendingPathComponent:@"amiibo_tags.json"];
+    if ([NSFileManager.defaultManager fileExistsAtPath:path]) {
+        _list = amiibo_list_parse([NSData dataWithContentsOfFile:path]);
+        if (!_list) LOG("amiibo: the list %s is not valid (delete it to download it again)", path.UTF8String);
+        return;
+    }
+    _loading = 1; LOG("amiibo: downloading the amiibo list");
+    NSURL *url = [NSURL URLWithString:@"https://raw.githubusercontent.com/Ryubing/Nfc/refs/heads/main/tags.json"];
+    [[NSURLSession.sharedSession dataTaskWithURL:url completionHandler:^(NSData *d, NSURLResponse *r, NSError *err) {
+        long status = [r isKindOfClass:NSHTTPURLResponse.class] ? (long)((NSHTTPURLResponse *)r).statusCode : 0;
+        NSArray *list = status == 200 ? amiibo_list_parse(d) : nil;
+        if (list) {   // the cache is written to a temp file and renamed only after the reply parses
+            NSString *tmp = [path stringByAppendingString:@".tmp"];
+            if (![d writeToFile:tmp atomically:NO] || rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation)) { LOG("amiibo: cannot write %s (errno=%d)", path.UTF8String, errno); unlink(tmp.fileSystemRepresentation); }
+        }
+        LOG("amiibo: list download %s (HTTP %ld, %lu bytes%s%s)", list ? "done" : "failed", status, (unsigned long)d.length, err ? ", " : "", err ? err.localizedDescription.UTF8String : "");
+        dispatch_async(dispatch_get_main_queue(), ^{ self->_loading = 0; self->_list = list; [self refilter:nil]; [self refresh]; });
+    }] resume];
+}
+// The header and Scan follow the game's search state; the details line shows the last scan or the selected amiibo
+- (void)refresh {
+    if (!_panel.isVisible) return;   // hidden with the app: nothing to update
+    int searching = dm_amiibo_searching() == 1;
+    _header.stringValue = searching ? @"The game is looking for an amiibo: choose one and Scan."
+                                    : @"The game is not looking for an amiibo now. Open the game's amiibo screen first.";
+    _header.textColor = searching ? NSColor.labelColor : NSColor.systemOrangeColor;
+    NSInteger row = _table.selectedRow;
+    _scan.enabled = searching && _list && row >= 0 && row < (NSInteger)_rows.count;
+    if (_last) { _details.stringValue = _last; return; }
+    if (!_list || row < 0 || row >= (NSInteger)_rows.count) { _details.stringValue = @""; return; }
+    NSDictionary *a = _rows[(NSUInteger)row];
+    _details.stringValue = [NSString stringWithFormat:@"%@ — %@\nID %@%@", amiibo_str(a, @"name"), amiibo_str(a, @"amiiboSeries"), amiibo_str(a, @"head"), amiibo_str(a, @"tail")];
+}
+- (void)refilter:(id)sender {
+    (void)sender;
+    NSString *q = _search.stringValue; int all = _all.state == NSControlStateValueOn;
+    NSMutableArray *rows = [NSMutableArray new];
+    for (id a in _list) {
+        if (![a isKindOfClass:NSDictionary.class] || amiibo_str(a, @"head").length != 8 || amiibo_str(a, @"tail").length != 8) continue;
+        if (!all && !amiibo_for_game(a)) continue;
+        NSStringCompareOptions o = NSCaseInsensitiveSearch | NSDiacriticInsensitiveSearch;
+        if (q.length && [amiibo_str(a, @"name") rangeOfString:q options:o].location == NSNotFound && [amiibo_str(a, @"amiiboSeries") rangeOfString:q options:o].location == NSNotFound) continue;
+        [rows addObject:a];
+    }
+    _rows = rows; [_table reloadData];
+    if (_rows.count && _table.selectedRow < 0) [_table selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+    [self refresh];
+}
+- (void)moveSelection:(NSInteger)by {   // up / down in the search field move the table's selection
+    if (!_rows.count) return;
+    NSInteger r = MAX(0, MIN((NSInteger)_rows.count - 1, _table.selectedRow + by));
+    [_table selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)r] byExtendingSelection:NO];
+    [_table scrollRowToVisible:r];
+}
+- (void)controlTextDidChange:(NSNotification *)n { (void)n; [self refilter:nil]; }
+// Return in the search field scans the selected row, Escape clears the search; both hand the keyboard back to the game
+- (BOOL)control:(NSControl *)c textView:(NSTextView *)tv doCommandBySelector:(SEL)cmd {
+    (void)c; (void)tv;
+    if (cmd == @selector(moveUp:)) { [self moveSelection:-1]; return YES; }
+    if (cmd == @selector(moveDown:)) { [self moveSelection:1]; return YES; }
+    if (cmd == @selector(insertNewline:)) { [self scan:nil]; [self giveKeyBack]; return YES; }
+    if (cmd == @selector(cancelOperation:)) { dispatch_async(dispatch_get_main_queue(), ^{ [self giveKeyBack]; }); return NO; }
+    return NO;
+}
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)t { (void)t; return _list ? (NSInteger)_rows.count : 1; }   // no list: one row with the state
+- (NSView *)tableView:(NSTableView *)t viewForTableColumn:(NSTableColumn *)col row:(NSInteger)row {
+    NSTextField *f = [t makeViewWithIdentifier:col.identifier owner:self];
+    if (!f) { f = [NSTextField labelWithString:@""]; f.identifier = col.identifier; f.lineBreakMode = NSLineBreakByTruncatingTail; }
+    int name = [col.identifier isEqualToString:@"Name"];
+    if (!_list) f.stringValue = !name ? @"" : _loading ? @"Loading the amiibo list…" : @"The amiibo list is not available";
+    else f.stringValue = amiibo_str(_rows[(NSUInteger)row], name ? @"name" : @"amiiboSeries");
+    return f;
+}
+- (BOOL)tableView:(NSTableView *)t shouldSelectRow:(NSInteger)row { (void)t; (void)row; return _list != nil; }
+- (void)tableViewSelectionDidChange:(NSNotification *)n { (void)n; _last = nil; [self refresh]; }
+// Scan (the button, a double-click, Return in the search field): place the selected amiibo; the panel stays open
+- (void)scan:(id)sender {
+    NSInteger row = sender == _table && _table.clickedRow >= 0 ? _table.clickedRow : _table.selectedRow;
+    if (!_list || row < 0 || row >= (NSInteger)_rows.count) return;
+    NSDictionary *a = _rows[(NSUInteger)row];
+    NSString *id_ = [amiibo_str(a, @"head") stringByAppendingString:amiibo_str(a, @"tail")];
+    if (!dm_amiibo_scan(id_.UTF8String, amiibo_str(a, @"name").UTF8String, _random.state == NSControlStateValueOn)) { NSBeep(); [self refresh]; return; }   // the game is not searching: the header says so
+    _last = [NSString stringWithFormat:@"Scanned %@. The game reads it from the controller.", amiibo_str(a, @"name")];
+    [self refresh];
+}
+// Reload List: read the cached list again, or download it when no cache exists
+- (void)reloadList:(id)sender { (void)sender; if (_loading) return; _list = nil; [self load]; [self refilter:nil]; }
+// Open Folder: the amiibo folder (created when missing) in Finder
+- (void)openFolder:(id)sender { (void)sender; [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:amiibo_folder()]]; }
+// Give the keyboard back to the game: after typing in the search field
+- (void)giveKeyBack { if (g_win && _panel.isKeyWindow) [g_win makeKeyWindow]; }
+// The panel became key: keep it only while the search field is edited, otherwise the keyboard goes back to the game a
+// main-queue turn later. While the panel is key, the game window's resign-key observer does not report focus state 2
+- (void)windowDidBecomeKey:(NSNotification *)n {
+    (void)n; g_picker_opening = 1;
+    dispatch_async(dispatch_get_main_queue(), ^{ if (!self->_search.currentEditor) [self giveKeyBack]; });
+}
+// Focus state 2 unless the game window or the panel is key on the next main-loop turn
+- (void)windowDidResignKey:(NSNotification *)n {
+    (void)n; g_picker_opening = 0;
+    dispatch_async(dispatch_get_main_queue(), ^{ if (!self->_panel.keyWindow && !g_win.keyWindow && !g_win.miniaturized) dm_focus_set(2); });
+}
+// The close button: hide instead of close (the panel object and its autosaved frame stay), and stop the timer
+- (BOOL)windowShouldClose:(NSWindow *)w {
+    (void)w;
+    [_timer invalidate]; _timer = nil;
+    [self giveKeyBack];   // while the panel is still key
+    [_panel orderOut:nil];
+    return NO;
+}
+@end
+static DmAmiiboPanel *g_picker;   // created at launch with the menu, the panel itself on the first show
+
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -1285,10 +1393,10 @@ void front_run(void (*guest)(void)) {
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
-        g_picker = [DmAmiiboPicker new];
+        g_picker = [DmAmiiboPanel new];
         NSMenu *am = [[NSMenu alloc] initWithTitle:@"Amiibo"];
         [[bar addItemWithTitle:@"Amiibo" action:nil keyEquivalent:@""] setSubmenu:am];
-        NSMenuItem *scan = [am addItemWithTitle:@"Scan Amiibo…" action:@selector(open:) keyEquivalent:@"a"];
+        NSMenuItem *scan = [am addItemWithTitle:@"Show Amiibo Window" action:@selector(show:) keyEquivalent:@"a"];
         scan.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift; scan.target = g_picker;
         NSApp.mainMenu = bar;
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
