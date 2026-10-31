@@ -1385,6 +1385,11 @@ void front_run(void (*guest)(void)) {
         NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"Window"];
         [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:app];
         [app addItemWithTitle:@"Quit " DM_GAME_NAME action:@selector(terminate:) keyEquivalent:@"q"];
+        g_picker = [DmAmiiboPanel new];
+        NSMenu *am = [[NSMenu alloc] initWithTitle:@"Amiibo"];
+        [[bar addItemWithTitle:@"Amiibo" action:nil keyEquivalent:@""] setSubmenu:am];
+        NSMenuItem *scan = [am addItemWithTitle:@"Show Amiibo Window" action:@selector(show:) keyEquivalent:@"a"];
+        scan.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift; scan.target = g_picker;
         // Cheats (hle_cheats.c): the rows rebuild on every open through the delegate, the same rows the file reload changes
         g_cheats_menu = [DmCheatsMenuDelegate new];
         NSMenu *cm = [[NSMenu alloc] initWithTitle:@"Cheats"];
@@ -1399,11 +1404,6 @@ void front_run(void (*guest)(void)) {
             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
-        g_picker = [DmAmiiboPanel new];
-        NSMenu *am = [[NSMenu alloc] initWithTitle:@"Amiibo"];
-        [[bar addItemWithTitle:@"Amiibo" action:nil keyEquivalent:@""] setSubmenu:am];
-        NSMenuItem *scan = [am addItemWithTitle:@"Show Amiibo Window" action:@selector(show:) keyEquivalent:@"a"];
-        scan.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift; scan.target = g_picker;
         NSApp.mainMenu = bar;
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
         if (fs && strcmp(fs, "0")) {
